@@ -53,6 +53,9 @@ jobs:
           $ffmpeg = (Get-Command ffmpeg).Source
           Copy-Item $ffmpeg dist/tune-server/
 
+      - name: Copy launcher bat
+        run: Copy-Item start-tune-server.bat dist/tune-server/
+
       - name: Create zip archive
         run: Compress-Archive -Path dist/tune-server -DestinationPath tune-server-win.zip
 
