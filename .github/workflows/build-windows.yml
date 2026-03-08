@@ -52,7 +52,9 @@ jobs:
       - name: Copy FFmpeg to dist
         run: |
           $ffmpeg = (Get-Command ffmpeg).Source
+          $ffprobe = (Get-Command ffprobe).Source
           Copy-Item $ffmpeg dist/tune-server/
+          Copy-Item $ffprobe dist/tune-server/
 
       - name: Copy launcher bat
         run: Copy-Item start-tune-server.bat dist/tune-server/
