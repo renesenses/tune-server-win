@@ -27,8 +27,31 @@ class Settings(BaseSettings):
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
     api_key: str | None = None  # None = no auth required (backward-compatible)
 
-    # Web UI (built SPA served as static files, empty = disabled)
+    # Web UI (built SPA served as static files, empty = auto-detect)
     web_dir: str | None = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        import sys
+        if getattr(sys, 'frozen', False):
+            # Running as PyInstaller bundle
+            base = Path(sys.executable).parent
+        else:
+            base = Path(__file__).resolve().parent.parent
+        # Auto-detect web/ directory next to the executable or project root
+        if self.web_dir is None:
+            candidate = base / "web"
+            if candidate.is_dir() and (candidate / "index.html").is_file():
+                self.web_dir = str(candidate)
+        # Auto-detect ffmpeg/ffprobe next to the executable
+        if self.ffmpeg_path == "ffmpeg":
+            candidate = base / "ffmpeg.exe"
+            if candidate.is_file():
+                self.ffmpeg_path = str(candidate)
+        if self.ffprobe_path == "ffprobe":
+            candidate = base / "ffprobe.exe"
+            if candidate.is_file():
+                self.ffprobe_path = str(candidate)
 
     # Server
     api_host: str = "0.0.0.0"
