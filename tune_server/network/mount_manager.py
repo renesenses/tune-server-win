@@ -6,8 +6,6 @@ import re
 import shutil
 from pathlib import Path
 
-import string
-
 import structlog
 
 from tune_server.config import settings
@@ -19,15 +17,6 @@ from tune_server.models import MountInfo, MountRequest, ShareProtocol
 logger = structlog.get_logger()
 
 _IS_MACOS = platform.system() == "Darwin"
-_IS_WINDOWS = platform.system() == "Windows"
-
-
-def _find_free_drive_letter() -> str | None:
-    """Find an available drive letter on Windows (Z down to D)."""
-    for letter in reversed(string.ascii_uppercase[3:]):  # D..Z
-        if not Path(f"{letter}:\\").exists():
-            return letter
-    return None
 
 
 class MountManager:
@@ -47,8 +36,7 @@ class MountManager:
 
     async def initialize(self) -> None:
         """Re-mount shares with auto_mount=1 at startup."""
-        if not _IS_WINDOWS:
-            self._mount_base.mkdir(parents=True, exist_ok=True)
+        self._mount_base.mkdir(parents=True, exist_ok=True)
 
         mounts = await self.list_mounts()
         for mount in mounts:
@@ -56,11 +44,7 @@ class MountManager:
                 continue
 
             mount_path = mount.mount_path
-            # Path.is_mount() doesn't work for Windows drive letters — use exists()
-            if _IS_WINDOWS:
-                is_os_mounted = Path(mount_path).exists()
-            else:
-                is_os_mounted = Path(mount_path).is_mount()
+            is_os_mounted = Path(mount_path).is_mount()
 
             if is_os_mounted:
                 # OS mount persisted across restart — just add to music_dirs
@@ -83,18 +67,12 @@ class MountManager:
 
     async def mount_share(self, request: MountRequest) -> MountInfo:
         """Mount a network share, persist in DB, add to music_dirs, and trigger scan."""
-        if _IS_WINDOWS:
-            # On Windows, mount to a drive letter instead of a subdirectory
-            drive = _find_free_drive_letter()
-            if not drive:
-                raise RuntimeError("No free drive letter available for mounting")
-            mount_path = f"{drive}:\\"
-        else:
-            # Build mount point path
-            safe_name = re.sub(r"[^\w\-.]", "_", f"{request.host}_{request.share_name}")
-            mount_point = self._mount_base / safe_name
-            mount_point.mkdir(parents=True, exist_ok=True)
-            mount_path = str(mount_point)
+        # Build mount point path
+        safe_name = re.sub(r"[^\w\-.]", "_", f"{request.host}_{request.share_name}")
+        mount_point = self._mount_base / safe_name
+        mount_point.mkdir(parents=True, exist_ok=True)
+
+        mount_path = str(mount_point)
 
         # Persist to DB first
         try:
@@ -197,14 +175,13 @@ class MountManager:
             source="mount_manager",
         ))
 
-        # Clean up mount directory (skip on Windows — drive letters are not directories)
-        if not _IS_WINDOWS:
-            mount_dir = Path(mount.mount_path)
-            if mount_dir.exists() and mount_dir.is_dir():
-                try:
-                    mount_dir.rmdir()  # Only removes if empty
-                except OSError:
-                    pass
+        # Clean up mount directory
+        mount_dir = Path(mount.mount_path)
+        if mount_dir.exists() and mount_dir.is_dir():
+            try:
+                mount_dir.rmdir()  # Only removes if empty
+            except OSError:
+                pass
 
     async def remount(self, mount_id: int) -> MountInfo:
         """Re-mount an existing share."""
@@ -228,8 +205,7 @@ class MountManager:
             raise ValueError(f"Mount {mount_id} not found")
 
         mount_path = row["mount_path"]
-        if not _IS_WINDOWS:
-            Path(mount_path).mkdir(parents=True, exist_ok=True)
+        Path(mount_path).mkdir(parents=True, exist_ok=True)
 
         request = MountRequest(
             host=row["host"],
@@ -269,7 +245,7 @@ class MountManager:
         try:
             cmd = self._build_mount_cmd(request, mount_path)
             # On Linux, mount requires root — use sudo (configured via sudoers)
-            if not _IS_MACOS and not _IS_WINDOWS:
+            if not _IS_MACOS:
                 cmd = ["sudo", "-n"] + cmd
             logger.info("os_mount_exec", cmd=cmd, host=request.host, share=request.share_name)
 
@@ -303,14 +279,7 @@ class MountManager:
     def _build_mount_cmd(request: MountRequest, mount_path: str) -> list[str]:
         """Build the OS-specific mount command."""
         if request.protocol == ShareProtocol.SMB:
-            if _IS_WINDOWS:
-                # net use Z: \\host\share /user:username password
-                drive_part = mount_path.rstrip("\\")  # "Z:"
-                cmd = ["net", "use", drive_part, f"\\\\{request.host}\\{request.share_name}"]
-                if request.username:
-                    cmd += [f"/user:{request.username}", request.password or ""]
-                return cmd
-            elif _IS_MACOS:
+            if _IS_MACOS:
                 # mount_smbfs //[user:pass@]host/share /mount/point
                 auth = ""
                 if request.username:
@@ -345,11 +314,7 @@ class MountManager:
 
         else:  # NFS
             share_path = request.share_name
-            if _IS_WINDOWS:
-                # Windows Services for NFS
-                drive_part = mount_path.rstrip("\\")
-                return ["mount", f"{request.host}:{share_path}", drive_part]
-            elif _IS_MACOS:
+            if _IS_MACOS:
                 return ["mount_nfs", f"{request.host}:{share_path}", mount_path]
             else:
                 return ["mount.nfs", f"{request.host}:{share_path}", mount_path]
@@ -357,13 +322,9 @@ class MountManager:
     async def _os_unmount(self, mount_path: str) -> None:
         """Execute OS unmount command."""
         try:
-            if _IS_WINDOWS:
-                drive_part = mount_path.rstrip("\\")  # "Z:"
-                cmd = ["net", "use", drive_part, "/delete", "/y"]
-            else:
-                cmd = ["umount", mount_path]
-                if not _IS_MACOS:
-                    cmd = ["sudo", "-n"] + cmd
+            cmd = ["umount", mount_path]
+            if not _IS_MACOS:
+                cmd = ["sudo", "-n"] + cmd
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,

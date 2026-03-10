@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import subprocess
 import time
 from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
-import httpx
 import structlog
 from mutagen import File as MutagenFile
 from mutagen.flac import FLAC
@@ -175,23 +176,24 @@ def fetch_cover_from_musicbrainz(
         return str(output_path)
 
     try:
-        headers = {"User-Agent": _MUSICBRAINZ_USER_AGENT}
-
         # Step 1: Search MusicBrainz for the release
         _musicbrainz_rate_limit()
         query = f'artist:"{artist_name}" AND release:"{album_title}"'
         search_url = "https://musicbrainz.org/ws/2/release/"
-        resp = httpx.get(
-            search_url,
-            params={"query": query, "fmt": "json", "limit": "1"},
-            headers=headers,
-            timeout=15,
+        result = subprocess.run(
+            ["curl", "-4sf", "--max-time", "15",
+             "-H", f"User-Agent: {_MUSICBRAINZ_USER_AGENT}",
+             "-G", search_url,
+             "--data-urlencode", f"query={query}",
+             "--data-urlencode", "fmt=json",
+             "--data-urlencode", "limit=1"],
+            capture_output=True, timeout=20,
         )
-        if resp.status_code != 200:
+        if result.returncode != 0:
             logger.debug("musicbrainz_search_failed", artist=artist_name, album=album_title)
             return None
 
-        data = resp.json()
+        data = json.loads(result.stdout)
         releases = data.get("releases", [])
         if not releases:
             logger.debug("musicbrainz_no_result", artist=artist_name, album=album_title)
@@ -202,17 +204,16 @@ def fetch_cover_from_musicbrainz(
         # Step 2: Fetch cover from Cover Art Archive
         _musicbrainz_rate_limit()
         cover_url = f"https://coverartarchive.org/release/{mbid}/front-500"
-        cover_resp = httpx.get(
-            cover_url,
-            headers=headers,
-            follow_redirects=True,
-            timeout=20,
+        cover_result = subprocess.run(
+            ["curl", "-4sfL", "--max-time", "20",
+             "-H", f"User-Agent: {_MUSICBRAINZ_USER_AGENT}",
+             "-o", str(output_path), cover_url],
+            capture_output=True, timeout=25,
         )
-        if cover_resp.status_code != 200:
+        if cover_result.returncode != 0 or not output_path.exists():
             logger.debug("musicbrainz_no_cover", artist=artist_name, album=album_title)
+            output_path.unlink(missing_ok=True)
             return None
-
-        output_path.write_bytes(cover_resp.content)
 
         # Step 3: Resize if needed
         img = Image.open(output_path)

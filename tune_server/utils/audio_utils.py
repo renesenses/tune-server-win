@@ -10,20 +10,12 @@ logger = structlog.get_logger()
 
 def check_ffmpeg() -> bool:
     """Check if FFmpeg is available on the system."""
-    from pathlib import Path
-    from tune_server.config import settings
-    if Path(settings.ffmpeg_path).is_file():
-        return True
-    return shutil.which(settings.ffmpeg_path) is not None
+    return shutil.which("ffmpeg") is not None
 
 
 def check_ffprobe() -> bool:
     """Check if ffprobe is available on the system."""
-    from pathlib import Path
-    from tune_server.config import settings
-    if Path(settings.ffprobe_path).is_file():
-        return True
-    return shutil.which(settings.ffprobe_path) is not None
+    return shutil.which("ffprobe") is not None
 
 
 def format_duration(ms: int) -> str:
