@@ -79,15 +79,38 @@ async def _resolve_tracks(request: PlayRequest) -> list:
             tracks = [t for t in resolved if t.file_path]
 
     elif request.source and request.source_id:
-        # Streaming service track — resolve track metadata AND stream URL
+        # Streaming service track — resolve track metadata AND stream URL.
+        # Invalidate any cached URL so a stopped/failed stream gets a fresh one.
         service = deps.streaming_services.get(request.source.value)
         if service and service.is_authenticated:
+            if hasattr(service, '_url_cache'):
+                service._url_cache.invalidate(request.source_id)
             track = await service.get_track(request.source_id)
             if track:
                 url = await service.get_stream_url(request.source_id)
                 if url:
                     track.file_path = url
                     tracks.append(track)
+
+    elif request.file_path:
+        # Direct URL playback (e.g. media server stream replay from history)
+        from tune_server.models import Track, AudioFormat
+        fmt = AudioFormat.WAV
+        url_lower = request.file_path.lower()
+        if "flac" in url_lower:
+            fmt = AudioFormat.FLAC
+        elif "mp3" in url_lower:
+            fmt = AudioFormat.MP3
+        elif "aac" in url_lower or "m4a" in url_lower:
+            fmt = AudioFormat.AAC
+        elif "ogg" in url_lower:
+            fmt = AudioFormat.OGG
+        tracks.append(Track(
+            id=None,
+            title=request.file_path.rsplit("/", 1)[-1],
+            file_path=request.file_path,
+            format=fmt,
+        ))
 
     return tracks
 
@@ -239,6 +262,24 @@ async def add_to_queue(zone_id: int, request: QueueAddRequest):
                 if url:
                     track.file_path = url
                     tracks.append(track)
+    elif request.file_path:
+        from tune_server.models import Track, AudioFormat
+        fmt = AudioFormat.WAV
+        url_lower = request.file_path.lower()
+        if "flac" in url_lower:
+            fmt = AudioFormat.FLAC
+        elif "mp3" in url_lower:
+            fmt = AudioFormat.MP3
+        elif "aac" in url_lower or "m4a" in url_lower:
+            fmt = AudioFormat.AAC
+        elif "ogg" in url_lower:
+            fmt = AudioFormat.OGG
+        tracks.append(Track(
+            id=None,
+            title=request.file_path.rsplit("/", 1)[-1],
+            file_path=request.file_path,
+            format=fmt,
+        ))
 
     if tracks:
         zone.player.queue.add_tracks(tracks, position=request.position)

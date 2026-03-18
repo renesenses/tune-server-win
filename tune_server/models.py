@@ -226,6 +226,7 @@ class PlayRequest(BaseModel):
     source_id: Optional[str] = None
     streaming_album_id: Optional[str] = None
     streaming_playlist_id: Optional[str] = None
+    file_path: Optional[str] = None  # Direct URL (e.g. media server stream)
 
 
 class QueueAddRequest(BaseModel):
@@ -234,6 +235,7 @@ class QueueAddRequest(BaseModel):
     album_id: Optional[int] = None
     source: Optional[Source] = None
     source_id: Optional[str] = None
+    file_path: Optional[str] = None  # Direct URL (e.g. media server stream)
     position: Optional[int] = None  # None = append to end
 
 
@@ -408,6 +410,7 @@ class FeaturedSection(BaseModel):
 class StreamingServiceStatus(BaseModel):
     enabled: bool
     authenticated: bool
+    iframe_only: bool = False
 
 
 class StreamingAuthRequest(BaseModel):
@@ -420,6 +423,7 @@ class StreamingAuthResponse(BaseModel):
     authenticated: bool
     verification_url: Optional[str] = None
     user_code: Optional[str] = None
+    error: Optional[str] = None
 
 
 class ZoneGroupResponse(BaseModel):

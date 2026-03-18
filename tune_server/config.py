@@ -15,29 +15,19 @@ def _detect_base_dir() -> Path:
     return Path.cwd()
 
 
-def _detect_data_dir() -> Path:
-    """Return PyInstaller's _internal data dir, or fall back to base dir."""
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        return Path(meipass)
-    return _detect_base_dir()
-
-
 def _detect_web_dir() -> str | None:
-    """Auto-detect web/ directory (in _internal/ for PyInstaller, or next to binary)."""
-    for base in [_detect_data_dir(), _detect_base_dir()]:
-        candidate = base / "web"
-        if candidate.is_dir() and (candidate / "index.html").is_file():
-            return str(candidate)
+    """Auto-detect web/ directory next to the binary."""
+    candidate = _detect_base_dir() / "web"
+    if candidate.is_dir() and (candidate / "index.html").is_file():
+        return str(candidate)
     return None
 
 
 def _detect_bin(name: str) -> str:
     """Auto-detect a bundled binary next to the executable, fallback to bare name (PATH)."""
-    for base in [_detect_base_dir(), _detect_data_dir()]:
-        candidate = base / name
-        if candidate.is_file():
-            return str(candidate)
+    candidate = _detect_base_dir() / name
+    if candidate.is_file():
+        return str(candidate)
     return name
 
 
@@ -106,12 +96,11 @@ class Settings(BaseSettings):
     qobuz_app_id: str | None = None
     qobuz_app_secret: str | None = None
 
-    # YouTube Music
+    # YouTube (Data API v3 + IFrame Player)
     youtube_enabled: bool = False
     youtube_client_id: str | None = None
     youtube_client_secret: str | None = None
-    youtube_oauth_json: str | None = None  # Legacy: path to oauth.json file
-    youtube_url_cache_ttl: int = 3600  # seconds (YouTube URLs expire ~6h)
+    youtube_api_key: str | None = None  # Optional: for unauthenticated search quota
 
     # Amazon Music
     amazon_music_enabled: bool = False
