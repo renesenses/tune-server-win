@@ -6,7 +6,7 @@ from pathlib import Path
 import structlog
 
 from tune_server.audio.buffer import AsyncRingBuffer
-from tune_server.audio.decoder import FFmpegDecoder
+from tune_server.audio.decoder import FFmpegDecoder, IcyMetadataCallback
 from tune_server.audio.formats import AudioCapabilities, can_passthrough
 from tune_server.models import AudioFormat, AudioStreamInfo
 
@@ -34,8 +34,13 @@ class AudioPipeline:
     Otherwise, decodes to PCM and re-encodes to a compatible format.
     """
 
-    def __init__(self, target_capabilities: AudioCapabilities) -> None:
+    def __init__(
+        self,
+        target_capabilities: AudioCapabilities,
+        icy_callback: IcyMetadataCallback | None = None,
+    ) -> None:
         self._capabilities = target_capabilities
+        self._icy_callback = icy_callback
         self._decoder: FFmpegDecoder | None = None
         self._output_buffer = AsyncRingBuffer(max_chunks=512)
         self._pipeline_task: asyncio.Task | None = None
@@ -109,27 +114,36 @@ class AudioPipeline:
             if out_depth < 16:
                 out_depth = 16
 
+            # For URL sources, prefer FLAC over WAV if target supports it.
+            # Some DLNA renderers (e.g. Micromega) can't handle streaming WAV
+            # (no Content-Length) but handle FLAC streams fine.
+            use_flac = _is_url and AudioFormat.FLAC in self._capabilities.formats
+            out_format = AudioFormat.FLAC if use_flac else AudioFormat.WAV
+
             logger.info(
                 "pipeline_decode",
                 source_format=source_format,
                 source_rate=sample_rate,
                 output_rate=out_rate,
                 output_depth=out_depth,
+                output_format=out_format,
             )
 
             self._stream_info = AudioStreamInfo(
-                format=AudioFormat.WAV,
+                format=out_format,
                 sample_rate=out_rate,
                 bit_depth=out_depth,
                 channels=channels,
             )
 
-            # Decoder: source file → raw PCM (streamed as WAV with header)
+            # Decoder: source file → PCM or encoded format
             self._decoder = FFmpegDecoder(
                 file_path=file_path,
                 sample_rate=out_rate,
                 bit_depth=out_depth,
                 channels=channels,
+                output_format=out_format if use_flac else None,
+                icy_callback=self._icy_callback if _is_url else None,
             )
             await self._decoder.start(seek_ms=seek_ms)
 
