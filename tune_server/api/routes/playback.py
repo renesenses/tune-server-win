@@ -5,6 +5,7 @@ import asyncio
 from fastapi import APIRouter, HTTPException
 
 from tune_server.api.deps import deps
+from tune_server.event_bus import Event, EventType
 from tune_server.models import (
     PlayRequest,
     QueueAddRequest,
@@ -107,7 +108,11 @@ async def _resolve_tracks(request: PlayRequest) -> list:
             fmt = AudioFormat.OGG
         tracks.append(Track(
             id=None,
-            title=request.file_path.rsplit("/", 1)[-1],
+            title=request.title or request.file_path.rsplit("/", 1)[-1],
+            artist_name=request.artist_name,
+            album_title=request.album_title,
+            cover_path=request.cover_path,
+            duration_ms=request.duration_ms or 0,
             file_path=request.file_path,
             format=fmt,
         ))
@@ -276,13 +281,19 @@ async def add_to_queue(zone_id: int, request: QueueAddRequest):
             fmt = AudioFormat.OGG
         tracks.append(Track(
             id=None,
-            title=request.file_path.rsplit("/", 1)[-1],
+            title=request.title or request.file_path.rsplit("/", 1)[-1],
+            artist_name=request.artist_name,
+            album_title=request.album_title,
+            cover_path=request.cover_path,
+            duration_ms=request.duration_ms or 0,
             file_path=request.file_path,
             format=fmt,
         ))
 
     if tracks:
         zone.player.queue.add_tracks(tracks, position=request.position)
+        # Notify clients
+        await deps.event_bus.emit(Event(type=EventType.PLAYBACK_QUEUE_CHANGED, data={"zone_id": zone_id}))
 
     return QueueLengthResponse(queue_length=zone.player.queue.length)
 
