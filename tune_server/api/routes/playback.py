@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 
+import structlog
+
 from fastapi import APIRouter, HTTPException
 
 from tune_server.api.deps import deps
@@ -21,7 +23,21 @@ from tune_server.models import (
     Zone,
 )
 
+logger = structlog.get_logger()
+
 router = APIRouter(prefix="/zones/{zone_id}", tags=["playback"])
+
+
+def _clean_file_title(file_path: str) -> str:
+    """Extract a clean title from a file path, avoiding raw UPnP IDs."""
+    import re
+    filename = file_path.rsplit("/", 1)[-1]
+    # Remove extension
+    name = filename.rsplit(".", 1)[0] if "." in filename else filename
+    # UPnP IDs look like: d1234567890-coXXXXXXXX or just hex/numbers
+    if re.match(r'^[a-f0-9d-]{20,}$', name, re.IGNORECASE):
+        return "Piste audio"
+    return filename
 
 
 def _get_zone(zone_id: int):
@@ -61,8 +77,15 @@ async def _resolve_tracks(request: PlayRequest) -> list:
                     t.file_path = url
                 return t
 
-            resolved = await asyncio.gather(*[resolve(t) for t in playlist_tracks])
-            tracks = [t for t in resolved if t.file_path]
+            try:
+                resolved = await asyncio.wait_for(
+                    asyncio.gather(*[resolve(t) for t in playlist_tracks], return_exceptions=True),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("resolve_tracks_timeout", type="streaming_playlist")
+                resolved = []
+            tracks = [t for t in resolved if not isinstance(t, Exception) and t.file_path]
 
     elif request.source and request.streaming_album_id:
         # Streaming album — resolve all tracks + URLs
@@ -76,8 +99,15 @@ async def _resolve_tracks(request: PlayRequest) -> list:
                     t.file_path = url
                 return t
 
-            resolved = await asyncio.gather(*[resolve_url(t) for t in album_tracks])
-            tracks = [t for t in resolved if t.file_path]
+            try:
+                resolved = await asyncio.wait_for(
+                    asyncio.gather(*[resolve_url(t) for t in album_tracks], return_exceptions=True),
+                    timeout=30,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("resolve_tracks_timeout", type="streaming_album")
+                resolved = []
+            tracks = [t for t in resolved if not isinstance(t, Exception) and t.file_path]
 
     elif request.source and request.source_id:
         # Streaming service track — resolve track metadata AND stream URL.
@@ -108,7 +138,7 @@ async def _resolve_tracks(request: PlayRequest) -> list:
             fmt = AudioFormat.OGG
         tracks.append(Track(
             id=None,
-            title=request.title or request.file_path.rsplit("/", 1)[-1],
+            title=request.title or _clean_file_title(request.file_path),
             artist_name=request.artist_name,
             album_title=request.album_title,
             cover_path=request.cover_path,
@@ -141,13 +171,17 @@ async def play(zone_id: int, request: PlayRequest = None):
 
     # If zone is in a group, play on all group members
     group = deps.group_manager.get_group_for_zone(zone_id) if deps.group_manager else None
-    if group and tracks:
-        await group.play(tracks)
-    elif tracks:
-        await zone.player.play(tracks=tracks)
-    else:
-        # Resume current queue (no specific track requested)
-        await zone.player.play()
+    try:
+        if group and tracks:
+            await group.play(tracks)
+        elif tracks:
+            await zone.player.play(tracks=tracks)
+        else:
+            # Resume current queue (no specific track requested)
+            await zone.player.play()
+    except Exception as e:
+        logger.exception("play_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
 
     return zone.to_model()
 
@@ -156,10 +190,14 @@ async def play(zone_id: int, request: PlayRequest = None):
 async def pause(zone_id: int):
     zone = _get_zone(zone_id)
     group = deps.group_manager.get_group_for_zone(zone_id) if deps.group_manager else None
-    if group:
-        await group.pause()
-    else:
-        await zone.player.pause()
+    try:
+        if group:
+            await group.pause()
+        else:
+            await zone.player.pause()
+    except Exception as e:
+        logger.exception("pause_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
@@ -167,10 +205,14 @@ async def pause(zone_id: int):
 async def resume(zone_id: int):
     zone = _get_zone(zone_id)
     group = deps.group_manager.get_group_for_zone(zone_id) if deps.group_manager else None
-    if group:
-        await group.resume()
-    else:
-        await zone.player.resume()
+    try:
+        if group:
+            await group.resume()
+        else:
+            await zone.player.resume()
+    except Exception as e:
+        logger.exception("resume_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
@@ -178,10 +220,14 @@ async def resume(zone_id: int):
 async def stop(zone_id: int):
     zone = _get_zone(zone_id)
     group = deps.group_manager.get_group_for_zone(zone_id) if deps.group_manager else None
-    if group:
-        await group.stop()
-    else:
-        await zone.player.stop()
+    try:
+        if group:
+            await group.stop()
+        else:
+            await zone.player.stop()
+    except Exception as e:
+        logger.exception("stop_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
@@ -189,10 +235,14 @@ async def stop(zone_id: int):
 async def skip_next(zone_id: int):
     zone = _get_zone(zone_id)
     group = deps.group_manager.get_group_for_zone(zone_id) if deps.group_manager else None
-    if group:
-        await group.skip_next()
-    else:
-        await zone.player.skip_next()
+    try:
+        if group:
+            await group.skip_next()
+        else:
+            await zone.player.skip_next()
+    except Exception as e:
+        logger.exception("skip_next_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
@@ -200,24 +250,42 @@ async def skip_next(zone_id: int):
 async def skip_previous(zone_id: int):
     zone = _get_zone(zone_id)
     group = deps.group_manager.get_group_for_zone(zone_id) if deps.group_manager else None
-    if group:
-        await group.skip_previous()
-    else:
-        await zone.player.skip_previous()
+    try:
+        if group:
+            await group.skip_previous()
+        else:
+            await zone.player.skip_previous()
+    except Exception as e:
+        logger.exception("skip_previous_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
 @router.post("/seek", response_model=Zone)
 async def seek(zone_id: int, request: SeekRequest):
     zone = _get_zone(zone_id)
-    await zone.player.seek(request.position_ms)
+    track = zone.player.current_track
+    if not track:
+        raise HTTPException(status_code=409, detail="No track playing")
+    position_ms = request.position_ms
+    if track.duration_ms and position_ms > track.duration_ms:
+        position_ms = track.duration_ms
+    try:
+        await zone.player.seek(position_ms)
+    except Exception as e:
+        logger.exception("seek_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
 @router.post("/volume", response_model=Zone)
 async def set_volume(zone_id: int, request: VolumeRequest):
     zone = _get_zone(zone_id)
-    await zone.player.set_volume(request.volume)
+    try:
+        await zone.player.set_volume(request.volume)
+    except Exception as e:
+        logger.exception("set_volume_route_error", zone_id=zone_id)
+        raise HTTPException(status_code=502, detail=f"Playback error: {e}")
     return zone.to_model()
 
 
@@ -281,7 +349,7 @@ async def add_to_queue(zone_id: int, request: QueueAddRequest):
             fmt = AudioFormat.OGG
         tracks.append(Track(
             id=None,
-            title=request.title or request.file_path.rsplit("/", 1)[-1],
+            title=request.title or _clean_file_title(request.file_path),
             artist_name=request.artist_name,
             album_title=request.album_title,
             cover_path=request.cover_path,
