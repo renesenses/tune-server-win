@@ -41,6 +41,7 @@ class Player:
         self._gapless: GaplessHandler | None = None
         self._queue_persist_cb: QueuePersistCallback | None = None
         self._volume_change_cb: Callable | None = None
+        self._recording_hook: Callable | None = None  # Called with (zone_id, track) before playback
         self._lock = asyncio.Lock()
 
     @property
@@ -78,6 +79,9 @@ class Player:
 
     def set_volume_change_callback(self, cb: Callable) -> None:
         self._volume_change_cb = cb
+
+    def set_recording_hook(self, cb: Callable) -> None:
+        self._recording_hook = cb
 
     async def _persist_queue(self) -> None:
         """Persist current queue state if callback is set."""
@@ -150,6 +154,13 @@ class Player:
                 await self._emit_playback_error("stream_url_failed", f"Failed to resolve URL for '{track.title}'", track)
                 await self._advance_track()
                 return
+
+        # Notify recording hook (captures track URL before playback starts)
+        if self._recording_hook:
+            try:
+                self._recording_hook(self._zone_id, track)
+            except Exception:
+                pass  # Recording errors should never affect playback
 
         # Check if output can handle URL directly (e.g., DLNA renderer fetching from CDN)
         # or if output handles native DSD passthrough (renderer pulls DSF via HTTP)
@@ -279,7 +290,11 @@ class Player:
 
     async def _playback_loop(self) -> None:
         try:
-            while self._state in (PlaybackState.PLAYING, PlaybackState.BUFFERING):
+            while self._state in (PlaybackState.PLAYING, PlaybackState.BUFFERING, PlaybackState.PAUSED):
+                # Wait while paused
+                if self._state == PlaybackState.PAUSED:
+                    await asyncio.sleep(0.1)
+                    continue
                 chunk = await self._pipeline.output_buffer.get()
                 if chunk is None:
                     # Track finished — try gapless transition
@@ -291,16 +306,36 @@ class Player:
                         await asyncio.wait_for(self._output.write(chunk), timeout=10)
                     except (asyncio.TimeoutError, IOError, ConnectionError, OSError):
                         logger.warning("output_write_failed", zone_id=self._zone_id)
-                        await self._emit_playback_error("output_disconnected", "Output device disconnected")
-                        self._state = PlaybackState.STOPPED
-                        break
+                        # Check if renderer is still playing (e.g. DLNA buffered data)
+                        renderer_pos = await self._output.get_position_ms() if self._output else -1
+                        if renderer_pos > 0:
+                            # Renderer still playing — switch to direct_url monitor mode
+                            logger.info("output_write_failed_but_renderer_playing",
+                                        zone_id=self._zone_id, renderer_pos=renderer_pos)
+                            break  # Exit pipeline loop, fall through to monitor below
+                        # Retry once
+                        await asyncio.sleep(1)
+                        try:
+                            await asyncio.wait_for(self._output.write(chunk), timeout=10)
+                            logger.info("output_write_recovered", zone_id=self._zone_id)
+                        except Exception:
+                            logger.error("output_write_failed_final", zone_id=self._zone_id)
+                            await self._emit_playback_error("output_disconnected", "Output device disconnected")
+                            self._state = PlaybackState.STOPPED
+                            break
 
             if self._output:
                 await self._output.flush()
 
-            # Auto-advance to next track
+            # Auto-advance to next track (or monitor renderer if it's still playing)
             if self._state == PlaybackState.PLAYING:
-                await self._advance_track()
+                # Check if renderer is still playing (pipeline broke but renderer buffered)
+                renderer_pos = await self._output.get_position_ms() if self._output else -1
+                if renderer_pos > 0 and self._queue.current:
+                    logger.info("switching_to_renderer_monitor", zone_id=self._zone_id)
+                    await self._direct_url_monitor(self._queue.current)
+                else:
+                    await self._advance_track()
 
         except asyncio.CancelledError:
             pass
@@ -312,17 +347,20 @@ class Player:
         """Monitor direct URL playback and auto-advance when track finishes."""
         try:
             duration_ms = track.duration_ms or 0
-            if not duration_ms:
-                # No duration info — cannot auto-advance, wait for user action or stop
-                while self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED):
-                    await asyncio.sleep(2)
-                return
 
             while self._state in (PlaybackState.PLAYING, PlaybackState.PAUSED, PlaybackState.BUFFERING):
                 await asyncio.sleep(1)
                 if self._state == PlaybackState.PAUSED:
                     continue
-                if self.position_ms >= duration_ms:
+
+                # Prefer output-reported position (recorder, some DLNA)
+                output_pos = await self._output.get_position_ms() if self._output else -1
+                pos = output_pos if output_pos >= 0 else self.position_ms
+
+                if duration_ms and pos >= duration_ms:
+                    break
+                # No duration but output signals completion (pos >= 1)
+                if not duration_ms and output_pos >= 1:
                     break
 
             if self._state == PlaybackState.PLAYING:
@@ -480,8 +518,13 @@ class Player:
             next_track = self._queue.next()
             if next_track:
                 await self._persist_queue()
-                await self._start_track(next_track)
-            else:
+                # Stop current playback quickly
+                await self._stop_pipeline()
+        # Start new track outside lock to avoid blocking other commands
+        if next_track:
+            await self._start_track(next_track)
+        else:
+            async with self._lock:
                 await self._stop_pipeline()
                 self._state = PlaybackState.STOPPED
                 self._position_ms = 0
@@ -494,28 +537,39 @@ class Player:
                 ))
 
     async def skip_previous(self) -> None:
+        # CD player behavior: if past 3 seconds, restart current track;
+        # if in the first 3 seconds, go to previous track
+        if self.position_ms > 3000 and self._queue.current:
+            track = self._queue.current
+            async with self._lock:
+                await self._stop_pipeline()
+            await self._start_track(track)
+            return
+
         async with self._lock:
             prev_track = self._queue.previous()
             if prev_track:
                 await self._persist_queue()
-                await self._start_track(prev_track)
+                await self._stop_pipeline()
+        if prev_track:
+            await self._start_track(prev_track)
 
     async def seek(self, position_ms: int) -> None:
+        track = self._queue.current
+        if not track:
+            return
+
+        if position_ms < 0:
+            position_ms = 0
+        if track.duration_ms and position_ms > track.duration_ms:
+            position_ms = track.duration_ms
+
         async with self._lock:
-            track = self._queue.current
-            if not track:
-                return
-
-            if position_ms < 0:
-                position_ms = 0
-            if track.duration_ms and position_ms > track.duration_ms:
-                position_ms = track.duration_ms
-
             was_playing = self._state == PlaybackState.PLAYING
             await self._stop_pipeline()
-
-            if was_playing:
-                await self._start_track(track, seek_ms=position_ms)
+        # Restart outside lock for responsiveness
+        if was_playing:
+            await self._start_track(track, seek_ms=position_ms)
 
     async def set_volume(self, volume: float) -> None:
         async with self._lock:
