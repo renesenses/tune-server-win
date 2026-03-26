@@ -64,7 +64,6 @@ def create_api_app() -> FastAPI:
     app.include_router(system.router, prefix="/api/v1")
     app.include_router(network.router, prefix="/api/v1")
     app.include_router(radios.router, prefix="/api/v1")
-
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         global _ws_manager
