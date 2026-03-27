@@ -64,12 +64,17 @@ class LocalOutput(OutputTarget):
                         device = i
                         break
 
+            # Windows WASAPI needs larger blocksize to avoid underruns
+            import sys
+            blk = 4096 if sys.platform == "win32" else 1024
+
             self._stream = sd.OutputStream(
                 samplerate=stream_info.sample_rate,
                 channels=stream_info.channels,
                 dtype=dtype,
                 device=device,
-                blocksize=1024,
+                blocksize=blk,
+                latency="high" if sys.platform == "win32" else "low",
             )
             self._stream.start()
             self._available = True
@@ -111,7 +116,16 @@ class LocalOutput(OutputTarget):
                     arr = arr[:-remainder]
                 arr = arr.reshape(-1, info.channels)
 
-            await asyncio.to_thread(self._stream.write, arr)
+            await asyncio.wait_for(
+                asyncio.to_thread(self._stream.write, arr),
+                timeout=5,
+            )
+        except asyncio.TimeoutError:
+            logger.warning("local_output_write_timeout")
+            self._recovery_attempts += 1
+            if self._recovery_attempts > 3:
+                self._available = False
+                raise IOError("Local output write timeout")
         except sd.PortAudioError:
             self._recovery_attempts += 1
             logger.warning("local_output_write_error_recovering", attempt=self._recovery_attempts)
