@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import sys
 from pathlib import Path
@@ -13,6 +14,20 @@ def _detect_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path.cwd()
+
+
+def _detect_data_dir() -> Path:
+    """Return a writable data directory for DB, cache, .env.
+
+    On Windows frozen builds, the exe directory may be read-only (Program Files).
+    Use LOCALAPPDATA/TuneServer instead.
+    """
+    if sys.platform == "win32" and getattr(sys, "frozen", False):
+        appdata = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+        data_dir = appdata / "TuneServer"
+        data_dir.mkdir(parents=True, exist_ok=True)
+        return data_dir
+    return _detect_base_dir()
 
 
 def _detect_web_dir() -> str | None:
@@ -35,7 +50,7 @@ def _detect_bin(name: str) -> str:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TUNE_",
-        env_file=str(_detect_base_dir() / ".env"),
+        env_file=str(_detect_data_dir() / ".env"),
         env_file_encoding="utf-8",
     )
 
@@ -45,8 +60,8 @@ class Settings(BaseSettings):
     watch_filesystem: bool = True
     watcher_debounce_seconds: float = 2.0
 
-    # Database — use base dir for frozen builds (Windows: CWD may be read-only)
-    db_path: str = Field(default_factory=lambda: str(_detect_base_dir() / "tune_server.db"))
+    # Database — writable data dir (AppData on Windows)
+    db_path: str = Field(default_factory=lambda: str(_detect_data_dir() / "tune_server.db"))
 
     # Security
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
@@ -85,8 +100,8 @@ class Settings(BaseSettings):
     max_sample_rate: int = 192000
     max_bit_depth: int = 24
 
-    # Artwork — use base dir for frozen builds
-    artwork_cache_dir: str = Field(default_factory=lambda: str(_detect_base_dir() / "artwork_cache"))
+    # Artwork — writable data dir (AppData on Windows)
+    artwork_cache_dir: str = Field(default_factory=lambda: str(_detect_data_dir() / "artwork_cache"))
     artwork_max_size: int = 1200  # max dimension in pixels
 
     # Streaming services
