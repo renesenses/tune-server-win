@@ -35,7 +35,7 @@ def _detect_bin(name: str) -> str:
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="TUNE_",
-        env_file=".env",
+        env_file=str(_detect_base_dir() / ".env"),
         env_file_encoding="utf-8",
     )
 
@@ -45,8 +45,8 @@ class Settings(BaseSettings):
     watch_filesystem: bool = True
     watcher_debounce_seconds: float = 2.0
 
-    # Database
-    db_path: str = "tune_server.db"
+    # Database — use base dir for frozen builds (Windows: CWD may be read-only)
+    db_path: str = Field(default_factory=lambda: str(_detect_base_dir() / "tune_server.db"))
 
     # Security
     cors_origins: list[str] = Field(default_factory=lambda: ["*"])
@@ -85,8 +85,8 @@ class Settings(BaseSettings):
     max_sample_rate: int = 192000
     max_bit_depth: int = 24
 
-    # Artwork
-    artwork_cache_dir: str = "artwork_cache"
+    # Artwork — use base dir for frozen builds
+    artwork_cache_dir: str = Field(default_factory=lambda: str(_detect_base_dir() / "artwork_cache"))
     artwork_max_size: int = 1200  # max dimension in pixels
 
     # Streaming services
