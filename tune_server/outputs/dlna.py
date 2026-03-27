@@ -68,12 +68,16 @@ def _build_didl_lite(
     art_tag = ""
     if track.cover_path:
         cover = track.cover_path
-        if not cover.startswith("http"):
-            from tune_server.config import settings
-            from tune_server.utils.network import get_local_ip
-            filename = cover.rsplit("/", 1)[-1] if "/" in cover else cover
-            ip = get_local_ip() or "localhost"
-            cover = f"http://{ip}:{settings.api_port}/api/v1/library/artwork/{filename}"
+        try:
+            if not cover.startswith("http"):
+                from tune_server.config import settings
+                from tune_server.utils.network import get_local_ip
+                # Windows: séparateurs \ pas /
+                filename = cover.replace("\\", "/").rsplit("/", 1)[-1] if ("/" in cover or "\\" in cover) else cover
+                ip = get_local_ip() or "localhost"
+                cover = f"http://{ip}:{settings.api_port}/api/v1/library/artwork/{filename}"
+        except Exception:
+            pass
         art_tag = f'<upnp:albumArtURI>{xml_escape(cover)}</upnp:albumArtURI>'
 
     # Use audioBroadcast class for radio streams
