@@ -39,6 +39,7 @@ jobs:
       - name: Build executable
         run: |
           pyinstaller --noconfirm --onedir --name tune-server `
+            --icon "tune-server.ico" `
             --add-data "web;web" `
             --add-data "tune_server/db/schema.sql;tune_server/db" `
             --hidden-import uvicorn.logging `
@@ -65,8 +66,11 @@ jobs:
           Copy-Item $ffmpeg dist/tune-server/
           Copy-Item $ffprobe dist/tune-server/
 
-      - name: Copy launcher bat
-        run: Copy-Item start-tune-server.bat dist/tune-server/
+      - name: Copy launcher, installer and icon
+        run: |
+          Copy-Item start-tune-server.bat dist/tune-server/
+          Copy-Item install.bat dist/tune-server/
+          Copy-Item tune-server.ico dist/tune-server/
 
       - name: Create zip archive
         run: Compress-Archive -Path dist/tune-server -DestinationPath tune-server-${{ steps.version.outputs.version }}-win-x64.zip
