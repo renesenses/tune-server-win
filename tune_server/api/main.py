@@ -11,7 +11,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from tune_server.api.deps import deps
-from tune_server.api.routes import devices, library, network, playback, playlists, radios, search, streaming, system, zones
+from tune_server.api.routes import devices, library, network, playback, playlist_manager, playlists, podcasts, profiles, radio_favorites, radios, search, streaming, system, zones
 from tune_server.api.websocket import WebSocketManager
 from tune_server.config import settings
 
@@ -39,13 +39,12 @@ def create_api_app() -> FastAPI:
     if settings.api_key:
         @app.middleware("http")
         async def check_api_key(request, call_next):
-            # Skip auth for docs, health, websocket, and static files
             path = request.url.path
+            # Always open: root, docs, health check
             if path in ("/", "/docs", "/openapi.json", "/api/v1/system/health"):
                 return await call_next(request)
-            if path == "/ws":
-                return await call_next(request)
-            if not path.startswith("/api/"):
+            # Static web UI assets (CSS/JS/images)
+            if not path.startswith("/api/") and path != "/ws":
                 return await call_next(request)
 
             key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
@@ -64,6 +63,10 @@ def create_api_app() -> FastAPI:
     app.include_router(system.router, prefix="/api/v1")
     app.include_router(network.router, prefix="/api/v1")
     app.include_router(radios.router, prefix="/api/v1")
+    app.include_router(radio_favorites.router, prefix="/api/v1")
+    app.include_router(profiles.router, prefix="/api/v1")
+    app.include_router(podcasts.router, prefix="/api/v1")
+    app.include_router(playlist_manager.router, prefix="/api/v1")
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         global _ws_manager

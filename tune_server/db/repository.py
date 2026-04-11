@@ -22,12 +22,30 @@ def _row_to_artist(row) -> Artist:
     )
 
 
+def _quality_from_audio(sample_rate: int | None, bit_depth: int | None, fmt: str | None) -> str:
+    if fmt and fmt in ("dsd", "dsf", "dff"):
+        return "dsd"
+    if sample_rate and sample_rate >= 2_000_000:
+        return "dsd"
+    if sample_rate and sample_rate > 44100:
+        return "hi-res"
+    if bit_depth and bit_depth > 16:
+        return "hi-res"
+    if fmt and fmt in ("mp3", "aac", "ogg", "opus", "wma"):
+        return "lossy"
+    return "cd"
+
+
 def _row_to_album(row) -> Album:
+    keys = row.keys()
+    sr = row["max_sample_rate"] if "max_sample_rate" in keys else None
+    bd = row["max_bit_depth"] if "max_bit_depth" in keys else None
+    fmt = row["dominant_format"] if "dominant_format" in keys else None
     return Album(
         id=row["id"],
         title=row["title"],
         artist_id=row["artist_id"],
-        artist_name=row["artist_name"] if "artist_name" in row.keys() else None,
+        artist_name=row["artist_name"] if "artist_name" in keys else None,
         year=row["year"],
         genre=row["genre"],
         disc_count=row["disc_count"],
@@ -35,6 +53,10 @@ def _row_to_album(row) -> Album:
         cover_path=row["cover_path"],
         source=row["source"],
         source_id=row["source_id"],
+        sample_rate=sr,
+        bit_depth=bd,
+        format=fmt,
+        quality=_quality_from_audio(sr, bd, fmt) if sr or bd or fmt else None,
     )
 
 
@@ -57,6 +79,7 @@ def _row_to_track(row) -> Track:
         cover_path=row["cover_path"] if "cover_path" in row.keys() else None,
         source=row["source"],
         source_id=row["source_id"],
+        isrc=row["isrc"] if "isrc" in row.keys() else None,
     )
 
 
@@ -83,15 +106,38 @@ class ArtistRepo:
         row = await self._db.fetchone("SELECT COUNT(*) as cnt FROM artists")
         return row["cnt"]
 
+    async def list_initial_letters(self) -> list[tuple[str, int]]:
+        rows = await self._db.fetchall(
+            """SELECT
+                 CASE WHEN UPPER(SUBSTR(COALESCE(sort_name, name), 1, 1)) BETWEEN 'A' AND 'Z'
+                      THEN UPPER(SUBSTR(COALESCE(sort_name, name), 1, 1)) ELSE '#' END AS letter,
+                 COUNT(*) AS cnt
+               FROM artists GROUP BY letter ORDER BY letter""",
+        )
+        return [(r["letter"], r["cnt"]) for r in rows]
+
+    async def list_by_letter(self, letter: str, limit: int = 500, offset: int = 0) -> list[Artist]:
+        if letter == "#":
+            where = "UPPER(SUBSTR(COALESCE(sort_name, name), 1, 1)) NOT BETWEEN 'A' AND 'Z'"
+            params: tuple = (limit, offset)
+        else:
+            where = "UPPER(SUBSTR(COALESCE(sort_name, name), 1, 1)) = ?"
+            params = (letter.upper(), limit, offset)
+        rows = await self._db.fetchall(
+            f"SELECT * FROM artists WHERE {where} ORDER BY sort_name, name LIMIT ? OFFSET ?",
+            params,
+        )
+        return [_row_to_artist(r) for r in rows]
+
     async def create(self, artist: Artist) -> int:
-        cursor = await self._db.execute(
+        result = await self._db.execute(
             """INSERT INTO artists (name, sort_name, musicbrainz_id, discogs_id, bio, image_path)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?) RETURNING id""",
             (artist.name, artist.sort_name, artist.musicbrainz_id,
              artist.discogs_id, artist.bio, artist.image_path),
         )
         await self._db.commit()
-        return cursor.lastrowid
+        return result.lastrowid
 
     async def get_or_create(self, name: str) -> Artist:
         existing = await self.get_by_name(name)
@@ -121,60 +167,96 @@ class ArtistRepo:
         return row["cnt"]
 
     async def search(self, query: str, limit: int = 50) -> list[Artist]:
-        rows = await self._db.fetchall(
-            """SELECT a.* FROM artists a
-               JOIN artists_fts fts ON a.id = fts.rowid
-               WHERE artists_fts MATCH ? LIMIT ?""",
-            (query + "*", limit),
-        )
+        if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            rows = await self._db.fetchall(
+                """SELECT a.* FROM artists a
+                   WHERE a.fts_vector @@ plainto_tsquery('simple', ?)
+                   ORDER BY ts_rank(a.fts_vector, plainto_tsquery('simple', ?)) DESC
+                   LIMIT ?""",
+                (query, query, limit),
+            )
+        else:
+            rows = await self._db.fetchall(
+                """SELECT a.* FROM artists a
+                   JOIN artists_fts fts ON a.id = fts.rowid
+                   WHERE artists_fts MATCH ? LIMIT ?""",
+                (query + "*", limit),
+            )
         return [_row_to_artist(r) for r in rows]
 
 
 class AlbumRepo:
+    _SELECT = """SELECT al.*, ar.name as artist_name,
+               tq.max_sample_rate, tq.max_bit_depth, tq.dominant_format
+               FROM albums al
+               LEFT JOIN artists ar ON al.artist_id = ar.id
+               LEFT JOIN (
+                   SELECT album_id,
+                          MAX(sample_rate) as max_sample_rate,
+                          MAX(bit_depth) as max_bit_depth,
+                          (SELECT format FROM tracks t2 WHERE t2.album_id = t.album_id
+                           GROUP BY format ORDER BY COUNT(*) DESC LIMIT 1) as dominant_format
+                   FROM tracks t WHERE album_id IS NOT NULL
+                   GROUP BY album_id
+               ) tq ON tq.album_id = al.id"""
+
     def __init__(self, db: Database) -> None:
         self._db = db
 
     async def get(self, album_id: int) -> Optional[Album]:
         row = await self._db.fetchone(
-            """SELECT al.*, ar.name as artist_name
-               FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id
-               WHERE al.id = ?""",
+            f"{self._SELECT} WHERE al.id = ?",
             (album_id,),
         )
         return _row_to_album(row) if row else None
 
     async def get_by_title_and_artist(self, title: str, artist_id: int) -> Optional[Album]:
         row = await self._db.fetchone(
-            """SELECT al.*, ar.name as artist_name
-               FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id
-               WHERE al.title = ? AND al.artist_id = ?""",
+            f"{self._SELECT} WHERE al.title = ? AND al.artist_id = ?",
             (title, artist_id),
         )
         return _row_to_album(row) if row else None
 
     async def get_by_title(self, title: str) -> Album | None:
         row = await self._db.fetchone(
-            """SELECT al.*, ar.name as artist_name
-               FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id
-               WHERE al.title = ? LIMIT 1""",
+            f"{self._SELECT} WHERE al.title = ? LIMIT 1",
             (title,),
         )
         return _row_to_album(row) if row else None
 
-    async def list(self, limit: int = 100, offset: int = 0) -> list[Album]:
+    async def list(self, limit: int = 100, offset: int = 0, quality: str | None = None,
+                   format: str | None = None, sample_rate: int | None = None) -> list[Album]:
+        where_clauses = []
+        params: list = []
+        if format:
+            where_clauses.append("tq.dominant_format = ?")
+            params.append(format.lower())
+        if sample_rate:
+            where_clauses.append("tq.max_sample_rate >= ?")
+            params.append(sample_rate)
+        where = ""
+        if where_clauses:
+            where = " WHERE " + " AND ".join(where_clauses)
+        params.extend([limit, offset])
         rows = await self._db.fetchall(
-            """SELECT al.*, ar.name as artist_name
-               FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id
-               ORDER BY al.title LIMIT ? OFFSET ?""",
-            (limit, offset),
+            f"{self._SELECT}{where} ORDER BY al.title LIMIT ? OFFSET ?",
+            tuple(params),
+        )
+        albums = [_row_to_album(r) for r in rows]
+        if quality:
+            albums = [a for a in albums if a.quality == quality]
+        return albums
+
+    async def list_recent(self, limit: int = 50) -> list[Album]:
+        rows = await self._db.fetchall(
+            f"{self._SELECT} ORDER BY al.created_at DESC LIMIT ?",
+            (limit,),
         )
         return [_row_to_album(r) for r in rows]
 
     async def list_by_artist(self, artist_id: int) -> list[Album]:
         rows = await self._db.fetchall(
-            """SELECT DISTINCT al.*, ar.name as artist_name
-               FROM albums al
-               LEFT JOIN artists ar ON al.artist_id = ar.id
+            f"""{self._SELECT}
                WHERE al.artist_id = ?
                   OR al.id IN (SELECT DISTINCT album_id FROM tracks WHERE artist_id = ?)
                ORDER BY al.year""",
@@ -186,17 +268,55 @@ class AlbumRepo:
         row = await self._db.fetchone("SELECT COUNT(*) as cnt FROM albums")
         return row["cnt"]
 
+    async def list_initial_letters(self) -> list[tuple[str, int]]:
+        """Return (letter, count) for alphabetical navigation. Non-alpha grouped as '#'."""
+        rows = await self._db.fetchall(
+            """SELECT
+                 CASE WHEN UPPER(SUBSTR(title, 1, 1)) BETWEEN 'A' AND 'Z'
+                      THEN UPPER(SUBSTR(title, 1, 1)) ELSE '#' END AS letter,
+                 COUNT(*) AS cnt
+               FROM albums GROUP BY letter ORDER BY letter""",
+        )
+        return [(r["letter"], r["cnt"]) for r in rows]
+
+    async def list_by_letter(self, letter: str, limit: int = 500, offset: int = 0) -> list[Album]:
+        if letter == "#":
+            where = "UPPER(SUBSTR(al.title, 1, 1)) NOT BETWEEN 'A' AND 'Z'"
+            params: tuple = (limit, offset)
+        else:
+            where = "UPPER(SUBSTR(al.title, 1, 1)) = ?"
+            params = (letter.upper(), limit, offset)
+        rows = await self._db.fetchall(
+            f"""SELECT al.*, ar.name as artist_name
+                FROM albums al LEFT JOIN artists ar ON al.artist_id = ar.id
+                WHERE {where} ORDER BY al.title LIMIT ? OFFSET ?""",
+            params,
+        )
+        return [_row_to_album(r) for r in rows]
+
+    async def count_by_letter(self, letter: str) -> int:
+        if letter == "#":
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) as cnt FROM albums WHERE UPPER(SUBSTR(title, 1, 1)) NOT BETWEEN 'A' AND 'Z'",
+            )
+        else:
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) as cnt FROM albums WHERE UPPER(SUBSTR(title, 1, 1)) = ?",
+                (letter.upper(),),
+            )
+        return row["cnt"]
+
     async def create(self, album: Album) -> int:
-        cursor = await self._db.execute(
+        result = await self._db.execute(
             """INSERT INTO albums (title, artist_id, year, genre, disc_count,
                track_count, cover_path, source, source_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (album.title, album.artist_id, album.year, album.genre,
              album.disc_count, album.track_count, album.cover_path,
              album.source, album.source_id),
         )
         await self._db.commit()
-        return cursor.lastrowid
+        return result.lastrowid
 
     async def get_or_create(self, title: str, artist_id: int, **kwargs) -> Album:
         existing = await self.get_by_title_and_artist(title, artist_id)
@@ -217,6 +337,16 @@ class AlbumRepo:
              album.source, album.source_id, album.id),
         )
         await self._db.commit()
+
+    async def get_dominant_sample_rate(self, album_id: int) -> int | None:
+        """Return the most common sample_rate among an album's tracks, or None if empty."""
+        row = await self._db.fetchone(
+            """SELECT sample_rate FROM tracks
+               WHERE album_id = ? AND sample_rate IS NOT NULL
+               GROUP BY sample_rate ORDER BY COUNT(*) DESC LIMIT 1""",
+            (album_id,),
+        )
+        return row["sample_rate"] if row else None
 
     async def update_track_count(self, album_id: int) -> None:
         await self._db.execute(
@@ -243,8 +373,12 @@ class AlbumRepo:
 
     async def merge_duplicates(self) -> int:
         """Merge albums with the same title: reassign tracks, delete dupes."""
+        if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            agg = "STRING_AGG(id::text, ',')"
+        else:
+            agg = "GROUP_CONCAT(id)"
         rows = await self._db.fetchall(
-            """SELECT title, MIN(id) as keep_id, GROUP_CONCAT(id) as all_ids
+            f"""SELECT title, MIN(id) as keep_id, {agg} as all_ids
                FROM albums GROUP BY title HAVING COUNT(*) > 1""",
         )
         merged = 0
@@ -295,13 +429,23 @@ class AlbumRepo:
         return [_row_to_album(r) for r in rows]
 
     async def search(self, query: str, limit: int = 50) -> list[Album]:
-        rows = await self._db.fetchall(
-            """SELECT al.*, ar.name as artist_name FROM albums al
-               LEFT JOIN artists ar ON al.artist_id = ar.id
-               JOIN albums_fts fts ON al.id = fts.rowid
-               WHERE albums_fts MATCH ? LIMIT ?""",
-            (query + "*", limit),
-        )
+        if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            rows = await self._db.fetchall(
+                """SELECT al.*, ar.name as artist_name FROM albums al
+                   LEFT JOIN artists ar ON al.artist_id = ar.id
+                   WHERE al.fts_vector @@ plainto_tsquery('simple', ?)
+                   ORDER BY ts_rank(al.fts_vector, plainto_tsquery('simple', ?)) DESC
+                   LIMIT ?""",
+                (query, query, limit),
+            )
+        else:
+            rows = await self._db.fetchall(
+                """SELECT al.*, ar.name as artist_name FROM albums al
+                   LEFT JOIN artists ar ON al.artist_id = ar.id
+                   JOIN albums_fts fts ON al.id = fts.rowid
+                   WHERE albums_fts MATCH ? LIMIT ?""",
+                (query + "*", limit),
+            )
         return [_row_to_album(r) for r in rows]
 
 
@@ -355,19 +499,54 @@ class TrackRepo:
         row = await self._db.fetchone("SELECT COUNT(*) as cnt FROM tracks")
         return row["cnt"]
 
+    async def list_initial_letters(self) -> list[tuple[str, int]]:
+        rows = await self._db.fetchall(
+            """SELECT
+                 CASE WHEN UPPER(SUBSTR(title, 1, 1)) BETWEEN 'A' AND 'Z'
+                      THEN UPPER(SUBSTR(title, 1, 1)) ELSE '#' END AS letter,
+                 COUNT(*) AS cnt
+               FROM tracks GROUP BY letter ORDER BY letter""",
+        )
+        return [(r["letter"], r["cnt"]) for r in rows]
+
+    async def list_by_letter(self, letter: str, limit: int = 500, offset: int = 0) -> list[Track]:
+        if letter == "#":
+            where = "UPPER(SUBSTR(t.title, 1, 1)) NOT BETWEEN 'A' AND 'Z'"
+            params: tuple = (limit, offset)
+        else:
+            where = "UPPER(SUBSTR(t.title, 1, 1)) = ?"
+            params = (letter.upper(), limit, offset)
+        rows = await self._db.fetchall(
+            f"{self._SELECT} WHERE {where} ORDER BY t.title LIMIT ? OFFSET ?",
+            params,
+        )
+        return [_row_to_track(r) for r in rows]
+
+    async def count_by_letter(self, letter: str) -> int:
+        if letter == "#":
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) as cnt FROM tracks WHERE UPPER(SUBSTR(title, 1, 1)) NOT BETWEEN 'A' AND 'Z'",
+            )
+        else:
+            row = await self._db.fetchone(
+                "SELECT COUNT(*) as cnt FROM tracks WHERE UPPER(SUBSTR(title, 1, 1)) = ?",
+                (letter.upper(),),
+            )
+        return row["cnt"]
+
     async def create(self, track: Track) -> int:
-        cursor = await self._db.execute(
+        result = await self._db.execute(
             """INSERT INTO tracks (title, album_id, artist_id, disc_number,
                track_number, duration_ms, file_path, format, sample_rate,
                bit_depth, channels, source, source_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (track.title, track.album_id, track.artist_id, track.disc_number,
              track.track_number, track.duration_ms, track.file_path,
              track.format, track.sample_rate, track.bit_depth,
              track.channels, track.source, track.source_id),
         )
         await self._db.commit()
-        return cursor.lastrowid
+        return result.lastrowid
 
     async def update(self, track: Track) -> None:
         await self._db.execute(
@@ -441,15 +620,27 @@ class TrackRepo:
         return {r["file_path"] for r in rows}
 
     async def search(self, query: str, limit: int = 50) -> list[Track]:
-        rows = await self._db.fetchall(
-            f"""SELECT t.*, al.title as album_title, ar.name as artist_name
-                FROM tracks t
-                LEFT JOIN albums al ON t.album_id = al.id
-                LEFT JOIN artists ar ON t.artist_id = ar.id
-                JOIN tracks_fts fts ON t.id = fts.rowid
-                WHERE tracks_fts MATCH ? LIMIT ?""",
-            (query + "*", limit),
-        )
+        if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            rows = await self._db.fetchall(
+                """SELECT t.*, al.title as album_title, ar.name as artist_name
+                    FROM tracks t
+                    LEFT JOIN albums al ON t.album_id = al.id
+                    LEFT JOIN artists ar ON t.artist_id = ar.id
+                    WHERE t.fts_vector @@ plainto_tsquery('simple', ?)
+                    ORDER BY ts_rank(t.fts_vector, plainto_tsquery('simple', ?)) DESC
+                    LIMIT ?""",
+                (query, query, limit),
+            )
+        else:
+            rows = await self._db.fetchall(
+                """SELECT t.*, al.title as album_title, ar.name as artist_name
+                    FROM tracks t
+                    LEFT JOIN albums al ON t.album_id = al.id
+                    LEFT JOIN artists ar ON t.artist_id = ar.id
+                    JOIN tracks_fts fts ON t.id = fts.rowid
+                    WHERE tracks_fts MATCH ? LIMIT ?""",
+                (query + "*", limit),
+            )
         return [_row_to_track(r) for r in rows]
 
     async def get_multiple(self, track_ids: list[int]) -> list[Track]:
@@ -468,36 +659,53 @@ class TrackRepo:
     async def list_by_directory(self, directory: str) -> list[Track]:
         """Return tracks directly in a directory (not in subdirectories)."""
         prefix = directory.replace("\\", "/").rstrip("/") + "/"
+        like_prefix = prefix + "%"
+        like_nested = prefix + "%/%"
         rows = await self._db.fetchall(
             f"""{self._SELECT}
-                WHERE t.file_path LIKE ? || '%'
-                AND t.file_path NOT LIKE ? || '%/%'
+                WHERE t.file_path LIKE ?
+                AND t.file_path NOT LIKE ?
                 ORDER BY t.file_path""",
-            (prefix, prefix),
+            (like_prefix, like_nested),
         )
         return [_row_to_track(r) for r in rows]
 
     async def list_subdirectories(self, directory: str) -> list[dict]:
         """Return immediate subdirectories with recursive track counts."""
         prefix = directory.replace("\\", "/").rstrip("/") + "/"
-        prefix_len = len(prefix) + 1  # SQL SUBSTR is 1-based
-        rows = await self._db.fetchall(
-            """SELECT
-                CASE
-                    WHEN INSTR(SUBSTR(file_path, ?), '/') > 0
-                    THEN SUBSTR(file_path, ?, INSTR(SUBSTR(file_path, ?), '/') - 1)
-                    ELSE SUBSTR(file_path, ?)
-                END AS dir_name,
-                COUNT(*) AS track_count
-               FROM tracks
-               WHERE file_path LIKE ? || '%'
-               AND LENGTH(file_path) > ?
-               GROUP BY dir_name
-               HAVING INSTR(SUBSTR(file_path, ?), '/') > 0
-               ORDER BY dir_name""",
-            (prefix_len, prefix_len, prefix_len, prefix_len,
-             prefix, len(prefix), prefix_len),
-        )
+        like_prefix = prefix + "%"
+        if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            rows = await self._db.fetchall(
+                """SELECT
+                    SPLIT_PART(SUBSTR(file_path, ?), '/', 1) AS dir_name,
+                    COUNT(*) AS track_count
+                   FROM tracks
+                   WHERE file_path LIKE ?
+                   AND LENGTH(file_path) > ?
+                   AND POSITION('/' IN SUBSTR(file_path, ?)) > 0
+                   GROUP BY dir_name
+                   ORDER BY dir_name""",
+                (len(prefix) + 1, like_prefix, len(prefix), len(prefix) + 1),
+            )
+        else:
+            prefix_len = len(prefix) + 1  # SQL SUBSTR is 1-based
+            rows = await self._db.fetchall(
+                """SELECT
+                    CASE
+                        WHEN INSTR(SUBSTR(file_path, ?), '/') > 0
+                        THEN SUBSTR(file_path, ?, INSTR(SUBSTR(file_path, ?), '/') - 1)
+                        ELSE SUBSTR(file_path, ?)
+                    END AS dir_name,
+                    COUNT(*) AS track_count
+                   FROM tracks
+                   WHERE file_path LIKE ?
+                   AND LENGTH(file_path) > ?
+                   GROUP BY dir_name
+                   HAVING INSTR(SUBSTR(file_path, ?), '/') > 0
+                   ORDER BY dir_name""",
+                (prefix_len, prefix_len, prefix_len, prefix_len,
+                 like_prefix, len(prefix), prefix_len),
+            )
         return [
             {"name": r["dir_name"], "path": prefix + r["dir_name"], "track_count": r["track_count"]}
             for r in rows
@@ -519,8 +727,8 @@ class TrackRepo:
         """Count all tracks under a root directory."""
         prefix = root_dir.replace("\\", "/").rstrip("/") + "/"
         row = await self._db.fetchone(
-            "SELECT COUNT(*) as cnt FROM tracks WHERE file_path LIKE ? || '%'",
-            (prefix,),
+            "SELECT COUNT(*) as cnt FROM tracks WHERE file_path LIKE ?",
+            (prefix + "%",),
         )
         return row["cnt"]
 
@@ -621,12 +829,12 @@ class ZoneRepo:
         return [dict(r) for r in rows]
 
     async def create(self, name: str, output_type: str, output_device_id: str = None) -> int:
-        cursor = await self._db.execute(
-            "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?)",
+        result = await self._db.execute(
+            "INSERT INTO zones (name, output_type, output_device_id) VALUES (?, ?, ?) RETURNING id",
             (name, output_type, output_device_id),
         )
         await self._db.commit()
-        return cursor.lastrowid
+        return result.lastrowid
 
     async def update(self, zone_id: int, **kwargs) -> None:
         sets = ", ".join(f"{k} = ?" for k in kwargs)
@@ -654,12 +862,12 @@ class PlaylistRepo:
         self._db = db
 
     async def create(self, name: str, description: Optional[str] = None) -> int:
-        cursor = await self._db.execute(
-            "INSERT INTO playlists (name, description) VALUES (?, ?)",
+        result = await self._db.execute(
+            "INSERT INTO playlists (name, description) VALUES (?, ?) RETURNING id",
             (name, description),
         )
         await self._db.commit()
-        return cursor.lastrowid
+        return result.lastrowid
 
     async def get(self, playlist_id: int) -> Optional[Playlist]:
         row = await self._db.fetchone(
@@ -789,15 +997,15 @@ class RadioStationRepo:
         self._db = db
 
     async def create(self, station: RadioStationCreate) -> int:
-        cursor = await self._db.execute(
+        result = await self._db.execute(
             """INSERT INTO radio_stations (name, stream_url, logo_url, genre, tags, codec, country, homepage_url, favorite)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id""",
             (station.name, station.stream_url, station.logo_url, station.genre,
              station.tags, station.codec, station.country, station.homepage_url,
              int(station.favorite)),
         )
         await self._db.commit()
-        return cursor.lastrowid
+        return result.lastrowid
 
     async def get(self, station_id: int) -> Optional[RadioStation]:
         row = await self._db.fetchone("SELECT * FROM radio_stations WHERE id = ?", (station_id,))
@@ -856,4 +1064,126 @@ async def full_text_search(db: Database, query: str, limit: int = 50) -> SearchR
     albums = await album_repo.search(query, limit)
     artists = await artist_repo.search(query, limit)
 
+    # Enrich: also fetch albums/tracks for matching artists
+    seen_album_ids = {a.id for a in albums if a.id}
+    seen_track_ids = {t.id for t in tracks if t.id}
+    for artist in artists:
+        if not artist.id:
+            continue
+        artist_albums = await album_repo.list_by_artist(artist.id)
+        for al in artist_albums:
+            if al.id and al.id not in seen_album_ids:
+                albums.append(al)
+                seen_album_ids.add(al.id)
+        artist_tracks = await track_repo.list_by_artist(artist.id)
+        for tr in artist_tracks:
+            if tr.id and tr.id not in seen_track_ids:
+                tracks.append(tr)
+                seen_track_ids.add(tr.id)
+        if len(albums) >= limit and len(tracks) >= limit:
+            break
+    tracks = tracks[:limit]
+    albums = albums[:limit]
+
     return SearchResult(tracks=tracks, albums=albums, artists=artists)
+
+
+# ---------------------------------------------------------------------------
+# RadioFavoriteRepo
+# ---------------------------------------------------------------------------
+
+class RadioFavoriteRepo:
+    def __init__(self, db):
+        self._db = db
+
+    async def ensure_table(self) -> None:
+        if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS radio_favorites (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL DEFAULT '',
+                    station_name TEXT NOT NULL DEFAULT '',
+                    cover_url TEXT,
+                    stream_url TEXT,
+                    saved_at TEXT NOT NULL DEFAULT (NOW()::text)
+                )
+            """)
+        else:
+            await self._db.execute("""
+                CREATE TABLE IF NOT EXISTS radio_favorites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    artist TEXT NOT NULL DEFAULT '',
+                    station_name TEXT NOT NULL DEFAULT '',
+                    cover_url TEXT,
+                    stream_url TEXT,
+                    saved_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+        await self._db.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_radio_favorites_dedup
+            ON radio_favorites(title, artist)
+        """)
+        await self._db.commit()
+
+    async def list(self, limit: int = 200, offset: int = 0) -> list[dict]:
+        rows = await self._db.fetchall(
+            "SELECT * FROM radio_favorites ORDER BY saved_at DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        )
+        return [dict(r) for r in rows]
+
+    async def count(self) -> int:
+        row = await self._db.fetchone("SELECT COUNT(*) as cnt FROM radio_favorites")
+        return row["cnt"]
+
+    async def save(self, title: str, artist: str, station_name: str = "",
+                   cover_url: str | None = None, stream_url: str | None = None) -> dict | None:
+        """Save a radio favorite. Deduplicates by (title, artist)."""
+        if not title:
+            return None
+        try:
+            await self._db.execute(
+                """INSERT INTO radio_favorites
+                   (title, artist, station_name, cover_url, stream_url)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT (title, artist) DO NOTHING""",
+                (title, artist, station_name, cover_url, stream_url),
+            )
+            await self._db.commit()
+            row = await self._db.fetchone(
+                "SELECT * FROM radio_favorites WHERE title = ? AND artist = ?",
+                (title, artist),
+            )
+            return dict(row) if row else None
+        except Exception:
+            return None
+
+    async def is_favorite(self, title: str, artist: str) -> bool:
+        row = await self._db.fetchone(
+            "SELECT 1 FROM radio_favorites WHERE title = ? AND artist = ?",
+            (title, artist),
+        )
+        return row is not None
+
+    async def delete(self, fav_id: int) -> None:
+        await self._db.execute("DELETE FROM radio_favorites WHERE id = ?", (fav_id,))
+        await self._db.commit()
+
+    async def clear(self) -> None:
+        await self._db.execute("DELETE FROM radio_favorites")
+        await self._db.commit()
+
+    async def export_csv(self) -> str:
+        """Export favorites as CSV (Artist,Title format for Soundiiz)."""
+        rows = await self._db.fetchall(
+            "SELECT artist, title, station_name, saved_at FROM radio_favorites ORDER BY saved_at DESC"
+        )
+        lines = ["Artist,Title,Station,Date"]
+        for r in rows:
+            artist = str(r["artist"]).replace('"', '""')
+            title = str(r["title"]).replace('"', '""')
+            station = str(r["station_name"]).replace('"', '""')
+            lines.append(f'"{artist}","{title}","{station}","{r["saved_at"]}"')
+        return "\n".join(lines)

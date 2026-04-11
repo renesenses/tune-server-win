@@ -75,6 +75,10 @@ class Album(BaseModel):
     cover_path: Optional[str] = None
     source: Source = Source.LOCAL
     source_id: Optional[str] = None
+    sample_rate: Optional[int] = None
+    bit_depth: Optional[int] = None
+    format: Optional[str] = None
+    quality: Optional[str] = None  # "hi-res", "cd", "lossy"
 
 
 class Track(BaseModel):
@@ -95,6 +99,7 @@ class Track(BaseModel):
     cover_path: Optional[str] = None
     source: Source = Source.LOCAL
     source_id: Optional[str] = None
+    isrc: Optional[str] = None
 
 
 class Playlist(BaseModel):
@@ -130,6 +135,28 @@ class Zone(BaseModel):
     current_track: Track | None = None
     position_ms: int = 0
     queue_length: int = 0
+    signal_path: SignalPath | None = None
+
+
+class SignalPathStep(BaseModel):
+    """A single step in the audio signal path."""
+    stage: str  # "source", "transport", "decode", "resample", "output"
+    description: str
+    format: str | None = None
+    sample_rate: int | None = None
+    bit_depth: int | None = None
+    channels: int | None = None
+    detail: str | None = None
+
+
+class SignalPath(BaseModel):
+    """Complete signal path from source to output."""
+    bit_perfect: bool = False
+    steps: list[SignalPathStep] = Field(default_factory=list)
+    summary: str = ""  # e.g. "Bit-Perfect" or "Transcoded (FLAC→WAV 96→48kHz)"
+    decisions: list[str] = Field(default_factory=list)
+    checksum: str | None = None  # MD5 of audio data (passthrough only)
+    checksum_verified: bool | None = None  # True if source==output hash
 
 
 class DiscoveredDevice(BaseModel):
@@ -202,6 +229,24 @@ class RadioImportResult(BaseModel):
     imported: int
     skipped: int
     errors: list[str]
+
+
+class RadioFavorite(BaseModel):
+    id: Optional[int] = None
+    title: str
+    artist: str = ""
+    station_name: str = ""
+    cover_url: Optional[str] = None
+    stream_url: Optional[str] = None
+    saved_at: Optional[str] = None
+
+
+class RadioFavoriteCreate(BaseModel):
+    title: str
+    artist: str = ""
+    station_name: str = ""
+    cover_url: Optional[str] = None
+    stream_url: Optional[str] = None
 
 
 # --- API request/response models ---
@@ -320,6 +365,105 @@ class PlaylistAddTracksRequest(BaseModel):
     position: Optional[int] = None  # None = append
 
 
+class PlaylistImportRequest(BaseModel):
+    service: str
+    playlist_id: str
+    name: str | None = None
+
+
+class PlaylistImportResponse(BaseModel):
+    playlist_id: int
+    name: str
+    tracks_imported: int
+
+
+class UnifiedPlaylistsResponse(BaseModel):
+    local: list[Playlist] = Field(default_factory=list)
+    services: dict[str, list[StreamingPlaylist]] = Field(default_factory=dict)
+
+
+class TrackMatchRequest(BaseModel):
+    title: str
+    artist_name: str
+    services: list[str] = Field(default_factory=list)
+
+
+class PlaylistTransferRequest(BaseModel):
+    source_service: str  # "qobuz", "tidal", "local"
+    source_playlist_id: str  # playlist ID on source
+    target_service: str  # "local", "qobuz", "tidal"
+    target_name: str | None = None  # name for new playlist
+
+
+class TransferTrackResult(BaseModel):
+    title: str
+    artist_name: str | None = None
+    status: str  # "matched", "not_found", "approximate"
+    source_id: str | None = None
+    target_id: str | None = None
+    target_service: str | None = None
+
+
+class PlaylistTransferResponse(BaseModel):
+    playlist_id: int | str | None = None
+    playlist_name: str
+    total_tracks: int
+    matched: int
+    not_found: int
+    approximate: int
+    tracks: list[TransferTrackResult]
+
+
+class PlaylistDiffRequest(BaseModel):
+    source_service: str
+    source_playlist_id: str
+    target_service: str
+    target_playlist_id: str
+
+
+class DiffTrackResult(BaseModel):
+    title: str
+    artist_name: str | None = None
+    in_source: bool
+    in_target: bool
+    match_quality: str | None = None  # "exact", "approximate", None
+
+
+class PlaylistDiffResponse(BaseModel):
+    source_name: str
+    target_name: str
+    only_in_source: list[DiffTrackResult]
+    only_in_target: list[DiffTrackResult]
+    in_both: list[DiffTrackResult]
+
+
+class RecoverTrackResult(BaseModel):
+    track_id: int
+    title: str
+    artist_name: str | None = None
+    status: str  # "available", "unavailable", "recovered"
+    original_source: str
+    alternatives: list[dict] = Field(default_factory=list)  # [{service, source_id, title, artist_name, quality}]
+
+
+class PlaylistRecoverResponse(BaseModel):
+    playlist_name: str
+    total_tracks: int
+    available: int
+    unavailable: int
+    recovered: int  # alternatives found
+    tracks: list[RecoverTrackResult]
+
+
+class RecoverApplyRequest(BaseModel):
+    replacements: list[dict]  # [{track_id: int, new_source: str, new_source_id: str}]
+
+
+class RecoverApplyResponse(BaseModel):
+    replaced: int
+    failed: int
+
+
 class PlaylistReorderRequest(BaseModel):
     track_ids: list[int]  # Full ordered list
 
@@ -330,6 +474,8 @@ class TrackUpdateRequest(BaseModel):
     artist_id: Optional[int] = None
     disc_number: Optional[int] = None
     track_number: Optional[int] = None
+    genre: Optional[str] = None
+    year: Optional[str] = None
 
 
 class AlbumUpdateRequest(BaseModel):
@@ -393,6 +539,29 @@ class SystemConfigResponse(BaseModel):
     sync_drift_threshold_ms: int = 500
     sync_correction_cooldown_s: float = 15.0
     sync_dlna_default_buffer_s: float = 3.0
+    # Database
+    db_engine: str = "sqlite"
+    db_path: str | None = None
+    db_pool_min: int | None = None
+    db_pool_max: int | None = None
+    db_connected: bool = True
+    # Audio quality
+    resample_policy: str = "auto"
+    audio_buffer_kb: int = 32
+    prebuffer_seconds: float = 0.5
+    local_exclusive_mode: bool = False
+    local_latency_ms: int = 50
+    # DSP
+    dsp_enabled: bool = False
+    dsp_filter: str = ""
+    dsp_impulse_response: str = ""
+    dsp_sample_rate: int = 0
+    # Metadata
+    metadata_readonly: bool = False
+    # Enrichment
+    discogs_token_set: bool = False
+    enrich_on_scan: bool = True
+    artists_without_image: int = 0
 
 
 class MusicDirRequest(BaseModel):
@@ -573,3 +742,39 @@ class MediaServerBrowseResult(BaseModel):
     items: list[MediaServerItem] = Field(default_factory=list)
     total_matches: int = 0
     number_returned: int = 0
+
+
+# --- User Profiles & Favorites ---
+
+
+class UserProfile(BaseModel):
+    id: Optional[int] = None
+    name: str
+    avatar_color: str = "#FF6B35"
+    created_at: Optional[str] = None
+
+
+class UserProfileCreate(BaseModel):
+    name: str
+    avatar_color: str = "#FF6B35"
+
+
+class UserFavorite(BaseModel):
+    id: Optional[int] = None
+    user_id: int
+    track_id: Optional[int] = None
+    album_id: Optional[int] = None
+    artist_id: Optional[int] = None
+    created_at: Optional[str] = None
+
+
+class UserFavoriteAdd(BaseModel):
+    track_id: Optional[int] = None
+    album_id: Optional[int] = None
+    artist_id: Optional[int] = None
+
+
+class UserFavoritesResponse(BaseModel):
+    tracks: list[Track] = Field(default_factory=list)
+    albums: list[Album] = Field(default_factory=list)
+    artists: list[Artist] = Field(default_factory=list)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Coroutine
@@ -33,12 +33,6 @@ class EventType(str, Enum):
     PLAYBACK_METADATA = "playback.metadata"
     PLAYBACK_QUEUE_CHANGED = "playback.queue_changed"
 
-    # Recording events
-    RECORDING_STARTED = "recording.started"
-    RECORDING_TRACK_SAVED = "recording.track_saved"
-    RECORDING_STOPPED = "recording.stopped"
-    RECORDING_ERROR = "recording.error"
-
     # Playlist events
     PLAYLIST_CREATED = "playlist.created"
     PLAYLIST_UPDATED = "playlist.updated"
@@ -58,6 +52,13 @@ class EventType(str, Enum):
     DEVICE_LOST = "device.lost"
     DEVICE_UPDATED = "device.updated"
 
+    # Playlist Manager events
+    PLAYLIST_MANAGER_TRANSFER_STARTED = "playlist_manager.transfer.started"
+    PLAYLIST_MANAGER_TRANSFER_PROGRESS = "playlist_manager.transfer.progress"
+    PLAYLIST_MANAGER_TRANSFER_COMPLETED = "playlist_manager.transfer.completed"
+    PLAYLIST_MANAGER_SYNC_COMPLETED = "playlist_manager.sync.completed"
+    PLAYLIST_MANAGER_BACKUP_COMPLETED = "playlist_manager.backup.completed"
+
     # Network events
     NETWORK_SHARE_DISCOVERED = "network.share.discovered"
     NETWORK_SHARE_LOST = "network.share.lost"
@@ -74,6 +75,8 @@ class EventType(str, Enum):
     # System events
     SYSTEM_STARTED = "system.started"
     SYSTEM_STOPPING = "system.stopping"
+    SYSTEM_UPDATE_AVAILABLE = "system.update_available"
+    SYSTEM_UPDATE_INSTALLED = "system.update_installed"
 
 
 @dataclass
@@ -86,10 +89,22 @@ class Event:
 Listener = Callable[[Event], Coroutine[Any, Any, None]]
 
 
+_BUFFERED_TYPES = {
+    EventType.PLAYBACK_STARTED,
+    EventType.PLAYBACK_PAUSED,
+    EventType.PLAYBACK_RESUMED,
+    EventType.PLAYBACK_STOPPED,
+    EventType.PLAYBACK_TRACK_CHANGED,
+    EventType.PLAYBACK_METADATA,
+    EventType.ZONE_VOLUME_CHANGED,
+}
+
+
 class EventBus:
     def __init__(self) -> None:
         self._listeners: dict[EventType, list[Listener]] = defaultdict(list)
         self._global_listeners: list[Listener] = []
+        self._recent_events: deque[Event] = deque(maxlen=50)
 
     def on(self, event_type: EventType, listener: Listener) -> Callable[[], None]:
         self._listeners[event_type].append(listener)
@@ -107,7 +122,14 @@ class EventBus:
 
         return unsubscribe
 
+    def get_recent_events(self) -> list[Event]:
+        """Get recent buffered events (for WebSocket replay to late-joining clients)."""
+        return list(self._recent_events)
+
     async def emit(self, event: Event) -> None:
+        if event.type in _BUFFERED_TYPES:
+            self._recent_events.append(event)
+
         listeners = list(self._listeners.get(event.type, []))
         listeners.extend(self._global_listeners)
 

@@ -298,8 +298,9 @@ class TidalService(StreamingService):
                 "refresh_token": self._session.refresh_token,
             })
             await db.execute(
-                "INSERT OR REPLACE INTO streaming_auth (service, token_data, updated_at) "
-                "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                "INSERT INTO streaming_auth (service, token_data, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT (service) DO UPDATE SET token_data = EXCLUDED.token_data, updated_at = CURRENT_TIMESTAMP",
                 ("tidal", token_data),
             )
             await db.commit()
@@ -387,10 +388,42 @@ class TidalService(StreamingService):
             return []
         try:
             import tidalapi
+
+            def _fetch_all():
+                all_playlists = []
+                # Fetch user's own playlists
+                try:
+                    own = self._session.user.playlists()
+                    all_playlists.extend([p for p in own if isinstance(p, tidalapi.Playlist)])
+                except Exception:
+                    pass
+                # Fetch favorite playlists (paginated)
+                try:
+                    favs = self._session.user.favorites
+                    offset = 0
+                    while True:
+                        batch = favs.playlists(limit=100, offset=offset)
+                        if not batch:
+                            break
+                        all_playlists.extend([p for p in batch if isinstance(p, tidalapi.Playlist)])
+                        if len(batch) < 100:
+                            break
+                        offset += 100
+                except Exception:
+                    pass
+                # Deduplicate by ID
+                seen = set()
+                unique = []
+                for p in all_playlists:
+                    if p.id not in seen:
+                        seen.add(p.id)
+                        unique.append(p)
+                return unique
+
             playlists = await asyncio.wait_for(
-                asyncio.to_thread(self._session.user.playlist_and_favorite_playlists), timeout=60
+                asyncio.to_thread(_fetch_all), timeout=120
             )
-            return [self._map_playlist(p) for p in playlists if isinstance(p, tidalapi.Playlist)]
+            return [self._map_playlist(p) for p in playlists]
         except Exception:
             logger.exception("tidal_user_playlists_error")
             return []
@@ -493,3 +526,40 @@ class TidalService(StreamingService):
             name=ar.name or "Unknown",
             source_id=str(ar.id),
         )
+
+    # ------------------------------------------------------------------
+    # Playlist write operations
+    # ------------------------------------------------------------------
+
+    @property
+    def supports_playlist_write(self) -> bool:
+        return True
+
+    async def create_playlist(self, name: str, description: str | None = None) -> str | None:
+        if not await self._ensure_authenticated():
+            return None
+        try:
+            playlist = await asyncio.to_thread(
+                self._session.user.create_playlist, name, description or ""
+            )
+            logger.info("tidal_playlist_created", name=name, id=playlist.id)
+            return str(playlist.id)
+        except Exception:
+            logger.exception("tidal_create_playlist_error")
+            return None
+
+    async def add_tracks_to_playlist(self, playlist_id: str, track_ids: list[str]) -> int:
+        if not await self._ensure_authenticated():
+            return 0
+        try:
+            playlist = await asyncio.to_thread(self._session.playlist, playlist_id)
+            # tidalapi expects list of track IDs as ints
+            int_ids = [int(tid) for tid in track_ids if tid.isdigit()]
+            if not int_ids:
+                return 0
+            await asyncio.to_thread(playlist.add, int_ids)
+            logger.info("tidal_tracks_added", playlist_id=playlist_id, count=len(int_ids))
+            return len(int_ids)
+        except Exception:
+            logger.exception("tidal_add_tracks_error")
+            return 0
