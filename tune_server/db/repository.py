@@ -621,6 +621,7 @@ class TrackRepo:
 
     async def search(self, query: str, limit: int = 50) -> list[Track]:
         if getattr(self._db, 'engine_name', 'sqlite') == 'postgres':
+            # Try FTS first, fallback to ILIKE for accent-sensitive queries
             rows = await self._db.fetchall(
                 """SELECT t.*, al.title as album_title, ar.name as artist_name
                     FROM tracks t
@@ -631,6 +632,30 @@ class TrackRepo:
                     LIMIT ?""",
                 (query, query, limit),
             )
+            if not rows:
+                # Fallback: ILIKE search (handles accents better)
+                # Strip "the" from query for better artist matching
+                clean_query = query.strip()
+                if clean_query.lower().startswith("the "):
+                    clean_query = clean_query[4:]
+                words = [w for w in clean_query.split() if len(w) > 1]
+                if words:
+                    conditions = " AND ".join(
+                        f"(t.title ILIKE ? OR ar.name ILIKE ?)" for _ in words
+                    )
+                    params = []
+                    for w in words:
+                        params.extend([f"%{w}%", f"%{w}%"])
+                    params.append(limit)
+                    rows = await self._db.fetchall(
+                        f"""SELECT t.*, al.title as album_title, ar.name as artist_name
+                            FROM tracks t
+                            LEFT JOIN albums al ON t.album_id = al.id
+                            LEFT JOIN artists ar ON t.artist_id = ar.id
+                            WHERE {conditions}
+                            LIMIT ?""",
+                        tuple(params),
+                    )
         else:
             rows = await self._db.fetchall(
                 """SELECT t.*, al.title as album_title, ar.name as artist_name
